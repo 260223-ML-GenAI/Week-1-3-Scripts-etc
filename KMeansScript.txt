@@ -1,0 +1,136 @@
+import pandas as pd
+import numpy as np
+import sagemaker
+from sagemaker import get_execution_role
+from sagemaker.image_uris import retrieve
+from sagemaker.estimator import Estimator
+from sagemaker.inputs import TrainingInput
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+
+# KEY DIFFERENCES FROM XGBOOST:
+# 1. Unsupervised — no target column, just like RCF
+# 2. We have to specify k (number of clusters) ourselves
+# 3. Output is a cluster label per row, not a predicted value
+# 4. We use Batch Transform again like RCF (same quota issue may apply!)
+
+# Load the housing data — same dataset they already know!
+data = pd.read_csv("s3://amazon-sagemaker-438465137857-us-east-1-44ymcqbpjvkxpj/shared/housing.csv")
+
+# CHANGE 1: Drop non-numeric and nulls — no target column needed
+data = data.select_dtypes(include="number")
+data = data.dropna()
+
+# CHANGE 2: Normalize the data
+# K-Means is sensitive to feature scale — a column with values in the
+# thousands (like house price) would dominate over a column with small
+# values (like num_bedrooms) without normalization
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler()
+data_scaled = pd.DataFrame(scaler.fit_transform(data), columns=data.columns)
+
+data_scaled.to_csv("housing_kmeans.csv", index=False, header=False)
+
+# S3 upload — same pattern as always
+session = sagemaker.Session()
+role = get_execution_role()
+bucket = session.default_bucket()
+prefix = "kmeans-housing"
+
+s3_input_path = session.upload_data(
+    path="housing_kmeans.csv",
+    bucket=bucket,
+    key_prefix=prefix
+)
+
+print("Uploaded to:", s3_input_path)
+
+# CHANGE 3: Retrieve the K-Means container
+container = retrieve(
+    framework="kmeans",
+    region=session.boto_region_name
+)
+
+kmeans_estimator = Estimator(
+    container,
+    role,
+    instance_count=1,
+    instance_type="ml.m5.large",
+    output_path=f"s3://{bucket}/{prefix}/output",
+    sagemaker_session=session
+)
+
+# CHANGE 4: K-Means hyperparameters
+# k is the big decision here — how many clusters do we want?
+# We'll use 3 for this demo: budget, mid-range, luxury neighborhoods
+kmeans_estimator.set_hyperparameters(
+    k=3,                        # number of clusters — we choose this!
+    feature_dim=data_scaled.shape[1],
+    mini_batch_size=500
+)
+
+# Train — same pattern as always
+train_input = TrainingInput(
+    s3_input_path,
+    content_type="text/csv;label_size=0",
+    distribution="ShardedByS3Key"  # same requirement as RCF!
+)
+kmeans_estimator.fit({"train": train_input})
+
+# Batch Transform to score the whole dataset
+# (same pattern as RCF — and same quota issue may apply, FYI)
+transformer = kmeans_estimator.transformer(
+    instance_count=1,
+    instance_type="ml.m5.large",  # change this if you hit quota issues
+    output_path=f"s3://{bucket}/{prefix}/clusters"
+)
+
+transformer.transform(
+    data=s3_input_path,
+    content_type="text/csv",
+    split_type="Line"
+)
+transformer.wait()
+
+print("Batch transform complete!")
+
+# Pull results from S3
+import boto3, io
+
+s3 = boto3.client("s3")
+cluster_key = f"{prefix}/clusters/housing_kmeans.csv.out"
+obj = s3.get_object(Bucket=bucket, Key=cluster_key)
+
+# K-Means output is JSON lines with a "closest_cluster" field
+import json
+lines = obj["Body"].read().decode("utf-8").strip().split("\n")
+cluster_labels = [json.loads(line)["closest_cluster"] for line in lines]
+cluster_labels = np.array(cluster_labels, dtype=int)
+
+# Add cluster labels back to original (unscaled) data for interpretation
+data["cluster"] = cluster_labels
+
+# VISUALIZATION 1: Scatter plot of income vs house value, colored by cluster
+colors = cm.Set1(np.linspace(0, 1, 3))
+plt.figure(figsize=(10, 6))
+for i in range(3):
+    subset = data[data["cluster"] == i]
+    plt.scatter(
+        subset["median_income"],
+        subset["median_house_value"],
+        alpha=0.3,
+        s=5,
+        label=f"Cluster {i}"
+    )
+plt.xlabel("Median Income")
+plt.ylabel("Median House Value")
+plt.title("K-Means Clusters — Income vs House Value")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# VISUALIZATION 2: Average feature values per cluster
+# This helps students interpret what each cluster actually represents
+cluster_summary = data.groupby("cluster").mean().round(2)
+print("\nCluster Summary (average feature values per cluster):")
+print(cluster_summary)

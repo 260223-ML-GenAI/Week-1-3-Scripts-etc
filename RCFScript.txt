@@ -1,0 +1,119 @@
+import pandas as pd
+import numpy as np
+import sagemaker
+from sagemaker import get_execution_role
+from sagemaker.image_uris import retrieve
+from sagemaker.estimator import Estimator
+from sagemaker.inputs import TrainingInput
+from sagemaker.serializers import CSVSerializer
+import matplotlib.pyplot as plt  # NEW: for visualizing anomalies at the end
+
+# KEY DIFFERENCES FROM XGBOOST:
+# 1. RCF deals with unsupervised data (no labels!)
+# 3. The output is an anomaly SCORE per row, not a predicted value
+# 4. We use a Batch Transform job instead of deploy + predict
+
+# CHANGE 0: Load the housing data, this time with anomalies!
+data = pd.read_csv("s3://amazon-sagemaker-438465137857-us-east-1-44ymcqbpjvkxpj/shared/housing_with_anomalies.csv")
+data.head()
+
+# CHANGE 1: No target column needed — RCF is unsupervised
+data = data.select_dtypes(include="number")
+data = data.dropna()
+
+data.to_csv("housing_rcf.csv", index=False, header=False)
+
+# CHANGE 2: Changing the prefix again for organization
+session = sagemaker.Session()
+role = get_execution_role()
+bucket = session.default_bucket()
+prefix = "rcf-housing"
+
+s3_input_path = session.upload_data(
+    path="housing_rcf.csv",
+    bucket=bucket,
+    key_prefix=prefix
+)
+
+print("Uploaded to:", s3_input_path)
+
+# CHANGE 3: Retrieve the RCF container
+container = retrieve(
+    framework="randomcutforest",
+    region=session.boto_region_name
+    # No version number needed unlike XGBoost
+)
+
+rcf_estimator = Estimator(
+    container,
+    role,
+    instance_count=1,
+    instance_type="ml.m5.large",
+    output_path=f"s3://{bucket}/{prefix}/output",
+    sagemaker_session=session
+)
+
+# CHANGE 4: RCF-specific hyperparameters
+# No objective or eval_metric — RCF figures out what's anomalous on its own
+rcf_estimator.set_hyperparameters(
+    num_samples_per_tree=512,  # how many data points each tree sees
+    num_trees=100,             # more trees = more stable anomaly scores
+    feature_dim=data.shape[1]  # all columns — no target to skip!
+)
+
+# Let's verify exactly what's going into the training job (thanks Claude)
+print("Number of columns (feature_dim will be set to):", data.shape[1])
+print("Number of rows:", data.shape[0])
+print("Column names:", list(data.columns))
+print("Dtypes:\n", data.dtypes)
+print("\nFirst row of CSV to confirm format:")
+print(data.head(1).to_csv(index=False, header=False))
+
+# Train — same pattern as always
+train_input = TrainingInput(s3_input_path, 
+content_type="text/csv;label_size=0", 
+distribution="ShardedByS3Key")
+rcf_estimator.fit({"train": train_input})
+
+# CHANGE 5: Batch Transform instead of deploy + predict
+# Scores every row at once — more practical for anomaly detection
+transformer = rcf_estimator.transformer(
+    instance_count=1,
+    instance_type="ml.m5.large",
+    output_path=f"s3://{bucket}/{prefix}/scores"
+)
+
+transformer.transform(
+    data=s3_input_path,
+    content_type="text/csv",
+    split_type="Line"
+)
+transformer.wait()
+
+print("Batch transform complete! Scores written to S3.")
+
+# Pull the scores back down and visualize anomalies
+import boto3, io
+
+s3 = boto3.client("s3")
+score_key = f"{prefix}/scores/housing_rcf.csv.out"
+obj = s3.get_object(Bucket=bucket, Key=score_key)
+scores_df = pd.read_json(io.BytesIO(obj["Body"].read()), lines=True)
+scores = scores_df["score"].values
+
+# CHANGE 6: Visualize! Flag anything above the 95th percentile as an anomaly
+threshold = np.percentile(scores, 95)
+anomalies = np.where(scores > threshold)[0]
+
+plt.figure(figsize=(14, 4))
+plt.plot(scores, label="Anomaly Score", color="steelblue")
+plt.axhline(threshold, color="red", linestyle="--", label="Threshold (95th percentile)")
+plt.scatter(anomalies, scores[anomalies], color="red", zorder=5, label="Flagged Anomalies")
+plt.title("RCF Anomaly Scores — Housing Dataset")
+plt.xlabel("Row Index")
+plt.ylabel("Anomaly Score")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print(f"Flagged {len(anomalies)} anomalous houses out of {len(scores)} total")
