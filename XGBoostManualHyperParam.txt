@@ -1,0 +1,108 @@
+import pandas as pd
+import numpy as np
+import sagemaker
+from sagemaker import get_execution_role
+from sagemaker.image_uris import retrieve
+from sagemaker.estimator import Estimator
+from sagemaker.inputs import TrainingInput
+from sagemaker.serializers import CSVSerializer
+
+# Load the housing CSV (replace this S3 URI with your own from the housing.csv files)
+data = pd.read_csv("s3://amazon-sagemaker-438465137857-us-east-1-44ymcqbpjvkxpj/shared/housing.csv")
+data.head()
+
+# Reorder the columns in the CSV to put house price first
+TARGET = "median_house_value"
+cols = [TARGET] + [col for col in data.columns if col != TARGET]
+data = data[cols]
+
+# CHANGE 1: We no longer need to drop non-numeric columns!
+# XGBoost can handle mixed feature types, unlike Linear Learner
+# data = data.select_dtypes(include="number")  <-- removed
+data = data.dropna()
+
+# Save without header or index — same pattern as before
+data.to_csv("cleaned_housing.csv", index=False, header=False)
+
+# S3 upload — identical pattern to what we've done before
+session = sagemaker.Session()
+role = get_execution_role()
+bucket = session.default_bucket()
+prefix = "xgboost-housing"  # CHANGE 2: Updated folder name to stay organized
+
+s3_input_path = session.upload_data(
+    path="cleaned_housing.csv",
+    bucket=bucket,
+    key_prefix=prefix
+)
+
+print("Uploaded to: ", s3_input_path)
+
+# CHANGE 3: Retrieve the XGBoost container instead of Linear Learner
+container = retrieve(
+    framework="xgboost",       # <-- swapped from "linear-learner"
+    region=session.boto_region_name,
+    version="1.7-1"            # <-- XGBoost requires a version number
+)
+
+# Estimator config is the same!
+xgb_estimator = Estimator(
+    container,
+    role,
+    instance_count=1,
+    instance_type="ml.m5.large",
+    output_path=f"s3://{bucket}/{prefix}/output",
+    sagemaker_session=session
+)
+
+# CHANGE 4: Different hyperparameters for XGBoost
+# XGBoost has its own set of params so this'll be pretty different from LinLearner
+# xgb_estimator.set_hyperparameters(
+#     objective="reg:squarederror",  # tells XGBoost this is a regression task
+#     num_round=100,                 # number of boosting rounds (like epochs)
+#     max_depth=5,                   # how deep each tree can grow
+#     eta=0.2,                       # learning rate
+#     eval_metric="rmse"             # what we're optimizing for
+# )
+
+# BAD HYPERPARAMETER DEMO
+# xgb_estimator.set_hyperparameters(
+#     objective="reg:squarederror",
+#     num_round=3,       # too few rounds, less chances to learn
+#     max_depth=2,       # shallow trees, leads to underfitting
+#     eta=0.99,            # too aggressive, learns too fast, misses things
+#     eval_metric="rmse"
+# )
+
+# Best HyperParam config I found (manual tweaking, not HPO)
+xgb_estimator.set_hyperparameters(
+    objective="reg:squarederror",
+    num_round=100,
+    max_depth=15,
+    eta=0.1,
+    eval_metric="rmse"
+)
+
+# Training job — same pattern as always
+train_input = TrainingInput(s3_input_path, content_type="text/csv")
+xgb_estimator.fit({"train": train_input})
+
+# Deploy — identical to Linear Learner
+predictor = xgb_estimator.deploy(
+    initial_instance_count=1,
+    instance_type="ml.m5.large"
+)
+
+# CHANGE 5: Slightly different prediction handling
+# XGBoost returns a plain string which we'll convert to a float
+# We'll also only include numbers in the prediction
+predictor.serializer = CSVSerializer()
+numeric_data = data.select_dtypes(include="number")
+sample = numeric_data.iloc[0, 1:].values.astype(np.float32).reshape(1, -1)
+
+result = predictor.predict(sample)
+
+print("Predicted house value: $", float(result))  # <-- float() works directly here
+
+# IMPORTANT - delete the endpoint after running to avoid billing
+predictor.delete_endpoint()
