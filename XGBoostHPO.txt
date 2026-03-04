@@ -1,0 +1,92 @@
+import pandas as pd
+import numpy as np
+import sagemaker
+from sagemaker import get_execution_role
+from sagemaker.image_uris import retrieve
+from sagemaker.estimator import Estimator
+from sagemaker.inputs import TrainingInput
+from sagemaker.tuner import HyperparameterTuner, ContinuousParameter, IntegerParameter
+from sklearn.model_selection import train_test_split
+
+session = sagemaker.Session()
+role = get_execution_role()
+bucket = session.default_bucket()
+prefix = "xgboost-housing"
+
+# STEP 1: Load and split the data into training and validation sets
+# HPO needs validation data to track improvement. Little more work here
+data = pd.read_csv(f"s3://{bucket}/{prefix}/cleaned_housing.csv", header=None)
+train_data, val_data = train_test_split(data, test_size=0.2, random_state=42)
+
+train_data.to_csv("train.csv", index=False, header=False)
+val_data.to_csv("validation.csv", index=False, header=False)
+
+# Upload both to S3
+s3_train_path = session.upload_data("train.csv", bucket=bucket, key_prefix=prefix)
+s3_val_path = session.upload_data("validation.csv", bucket=bucket, key_prefix=prefix)
+
+print("Train uploaded to:", s3_train_path)
+print("Validation uploaded to:", s3_val_path)
+
+# STEP 2: Set up the container
+container = retrieve(
+    framework="xgboost",
+    region=session.boto_region_name,
+    version="1.7-1"
+)
+
+# STEP 3: Base estimator — no manual hyperparameters, tuner handles that
+xgb_estimator = Estimator(
+    container,
+    role,
+    instance_count=1,
+    instance_type="ml.m5.large",
+    output_path=f"s3://{bucket}/{prefix}/tuning-output",
+    sagemaker_session=session
+)
+
+# Only set the task type — tuner will handle the rest
+xgb_estimator.set_hyperparameters(
+    objective="reg:squarederror",
+    eval_metric="rmse"
+)
+
+# STEP 4: Define the ranges the tuner can explore
+hyperparameter_ranges = {
+    "eta": ContinuousParameter(0.01, 0.3),
+    "max_depth": IntegerParameter(3, 10),
+    "num_round": IntegerParameter(50, 200),
+}
+
+# STEP 5: Configure the tuner
+# Note the use of the Bayesian strategy!
+tuner = HyperparameterTuner(
+    estimator=xgb_estimator,
+    objective_metric_name="validation:rmse",
+    hyperparameter_ranges=hyperparameter_ranges,
+    strategy="Bayesian",
+    objective_type="Minimize",
+    max_jobs=6,  # 6 training jobs
+    max_parallel_jobs=2  # only up to 2 jobs running at a time
+)
+
+# STEP 6: Launch with both train and validation data
+train_input = TrainingInput(s3_train_path, content_type="text/csv")
+val_input = TrainingInput(s3_val_path, content_type="text/csv")
+
+tuner.fit({
+    "train": train_input,
+    "validation": val_input
+})
+tuner.wait()
+
+print("Tuning complete!")
+
+# STEP 7: See the results
+best_job = tuner.best_training_job()
+print("Best training job:", best_job)
+
+df = tuner.analytics().dataframe()
+print(df[["TrainingJobName", "FinalObjectiveValue", "eta", "max_depth", "num_round"]]
+      .sort_values("FinalObjectiveValue")
+      .head(10))
